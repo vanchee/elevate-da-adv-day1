@@ -7,7 +7,7 @@
 | Field | Value |
 | :---- | :---- |
 | Author(s) | Sarath P V (vanchee) / Google Cloud Enterprise Architecture Team |
-| Document Version | 1.1 (Production Baseline) |
+| Document Version | 1.2 (Enterprise Final) |
 | Date | September 8, 2026 |
 | Status | Approved (Ready for Enterprise Production) |
 | Target Audience | Evaluation Committee, Enterprise Lead Architects, CIO, CISO, VP of Data & AI |
@@ -320,7 +320,78 @@ To eliminate redundant database lookups and prevent multi-turn conversational fr
 
 ## **4.1. Entity Definitions & Schema**
 
-### **1. Gold Transactional Table (`historical_transactional_data`)**
+### **1. POS Transaction Streaming JSON Schema Contract (`pos-transactions`)**
+To eliminate ambiguity for streaming pipeline engineers, all 50 stores emit telemetry to Google Managed Kafka conforming to this strict JSON schema:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "POSTransactionEvent",
+  "type": "object",
+  "required": [
+    "transaction_id",
+    "timestamp",
+    "store_id",
+    "cashier_id",
+    "terminal_id",
+    "basket",
+    "payment",
+    "total_amount"
+  ],
+  "properties": {
+    "transaction_id": { "type": "string", "pattern": "^TXN-[0-9]{8}-[0-9]{7}$", "example": "TXN-20260312-0015811" },
+    "timestamp": { "type": "string", "format": "date-time", "example": "2026-03-12T14:22:10Z" },
+    "store_id": { "type": "string", "pattern": "^STORE_[0-9]{3}$", "example": "STORE_008" },
+    "cashier_id": { "type": "string", "pattern": "^CASH_[0-9]{4}$", "example": "CASH_1190" },
+    "terminal_id": { "type": "string", "pattern": "^TERM_[0-9]{3}$", "example": "TERM_002" },
+    "customer": {
+      "type": "object",
+      "properties": {
+        "customer_id": { "type": "string", "example": "CUST_02598" },
+        "loyalty_tier": { "type": "string", "enum": ["NONE", "BRONZE", "SILVER", "GOLD", "PLATINUM"], "default": "NONE" }
+      }
+    },
+    "basket": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["product_id", "product_name", "quantity", "unit_price"],
+        "properties": {
+          "product_id": { "type": "string", "example": "prod_4825" },
+          "product_name": { "type": "string", "example": "Smart POS Dock" },
+          "quantity": { "type": "integer", "minimum": 1, "example": 1 },
+          "unit_price": { "type": "number", "minimum": 0, "example": 149.99 },
+          "discount_amount": { "type": "number", "minimum": 0, "default": 0.0 },
+          "discount_override_applied": { "type": "boolean", "default": false }
+        }
+      }
+    },
+    "payment": {
+      "type": "object",
+      "required": ["payment_type"],
+      "properties": {
+        "payment_type": { "type": "string", "enum": ["CARD", "CASH", "GIFT_CARD"] },
+        "card_number": { "type": "string", "pattern": "^[0-9]{16}$", "description": "Raw PAN masked downstream via Cloud DLP and CLS" },
+        "auth_code": { "type": "string", "example": "AUTH-88219" }
+      }
+    },
+    "total_amount": { "type": "number", "minimum": 0, "example": 149.99 }
+  }
+}
+```
+
+### **2. Anti-Hotspotting Bigtable Row Key Design**
+To prevent tablet hotspotting across Cloud Bigtable nodes during peak store shopping hours while maintaining sub-10ms point lookups:
+* **Anti-Hotspotting Pattern**: Reverse timestamp salt prefixed by store and cashier hash:
+  `STORE#<store_id>#CASHIER#<cashier_id>#<REVERSED_TIMESTAMP>`
+  - Where `REVERSED_TIMESTAMP = (9999999999 - unix_epoch_seconds)`.
+  - This guarantees that newest transactions sort first without creating write hotspots on a single tablet server.
+* **Column Families**:
+  - `cf_realtime`: Stores sliding-window metrics (`promo_override_count`, `sliding_1h_override_rate`, `active_anomaly_flag`, `last_scored_at`).
+  - `cf_audit`: Stores terminal error events (`last_pos_error_code`, `error_timestamp`).
+
+### **3. Gold Transactional Table (`historical_transactional_data`)**
 * **Type**: BigQuery Native Table (Partitioned by `DATE(transaction_timestamp)`, Clustered by `store_id`, `cashier_id`).
 * **Schema**:
   - `transaction_id`: `STRING` (Primary Key)
@@ -338,7 +409,7 @@ To eliminate redundant database lookups and prevent multi-turn conversational fr
   - `payment_type`: `STRING` (`CARD`, `CASH`, `GIFT_CARD`)
   - `card_number`: `STRING` (Tagged with `data_governance.card_number_policy`, dynamically masked)
 
-### **2. BigLake Managed Iceberg Table (`gold_inventory_reconciliation_ledger`)**
+### **4. BigLake Managed Iceberg Table (`gold_inventory_reconciliation_ledger`)**
 * **Type**: BigLake Iceberg Table on GCS (`gs://<PROJECT_ID>-module1-bucket/gold_inventory_reconciliation_ledger/`).
 * **Schema**:
   - `reconciliation_id`: `STRING`
@@ -351,7 +422,7 @@ To eliminate redundant database lookups and prevent multi-turn conversational fr
   - `discrepancy_units`: `INT64`
   - `shrinkage_flag`: `BOOLEAN`
 
-### **3. Bigtable Operational Cache (`operations-db` / `pos_operational_metrics`)**
+### **5. Bigtable Operational Cache Schema (`operations-db`)**
 * **Column Family**: `cf_realtime`
 * **Row Key Design**: `STORE#<store_id>#CASHIER#<cashier_id>#<YYYYMMDDHH>`
 * **Columns**:
@@ -420,7 +491,44 @@ To prevent unauthorized privilege escalation or analytical leakage, the Gateway 
 
 ---
 
-## **4.5. Data Privacy, Masking & Governance**
+### **4.5. Gateway-Level PII Masking: Cloud DLP & Regex Specifications**
+
+To guarantee zero customer payment card leakage across conversational chat interfaces, agent thoughts, and Cloud Logging streams:
+
+1. **Cloud DLP API Inspection & De-Identification Integration**:
+   * **API Call**: Invokes Cloud DLP `projects.locations.content.deidentify` on all tool outputs.
+   * **De-identify Configuration**:
+     ```json
+     {
+       "deidentifyConfig": {
+         "infoTypeTransformations": {
+           "transformations": [
+             {
+               "infoTypes": [{ "name": "CREDIT_CARD_NUMBER" }],
+               "primitiveTransformation": {
+                 "characterMaskConfig": {
+                   "maskingCharacter": "X",
+                   "numberToMask": 12,
+                   "reverseOrder": false
+                 }
+               }
+             }
+           ]
+         }
+       }
+     }
+     ```
+2. **In-Flight Regex Sanitization Fallback**:
+   To eliminate reliance on external network calls for high-frequency chat turns, the Cloud Run Gateway executes local in-memory regex sanitization:
+   * **Target Regex**: `\b(?:\d{4}[-\s]?){3}(\d{4})\b`
+   * **Replacement**: `XXXX-XXXX-XXXX-$1`
+   * Runs as a pre-streaming filter on all outbound SSE event streams.
+
+3. **Cryptographic Identity Passing for Row-Level Security (RLS)**:
+   * End-user authentication terminates at Google Identity-Aware Proxy (IAP) or verified corporate identity gateway.
+   * Client transmits an RS256-signed JWT in the `X-Forwarded-Authorization` header.
+   * The Coordinator Router cryptographically verifies the JWT against Google OAuth2 JWKS (`https://www.googleapis.com/oauth2/v3/certs`), verifying `aud`, `iss`, and `exp`.
+   * Extracted verified claim `store_id` is passed as a session parameter into BigQuery execution, driving `store_manager_isolation_policy` (`store_id = SESSION_USER()`).
 
 * **Dataplex Taxonomy**: Created central taxonomy `retail_governance` with policy tag `card_number_policy`.
 * **Dynamic Column-Level Security (CLS)**:
@@ -442,7 +550,7 @@ To prevent unauthorized privilege escalation or analytical leakage, the Gateway 
 
 | Tool / Interface Name | Calling Agent | Target System | Input Parameters | Expected Output / SLA | Error / Fallback Behavior |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `query_sql_analytics` | Analytical SQL Sub-Agent | BigQuery Engine | `query_sql: STRING`<br>`session_user_token: STRING` | Result set JSON array (`rows: [...]`), execution latency <3.0s | Enforces mandatory partition filter on `transaction_timestamp`. If table uncertified or syntax error, return plain-language explanation; if timeout, return "Warehouse busy". |
+| `query_sql_analytics` | Analytical SQL Sub-Agent | BigQuery Engine | `query_sql: STRING`<br>`session_user_token: STRING` | Result set JSON array (`rows: [...]`), execution latency <3.0s | **Programmatic AST & Setting Enforcement**: The BigQuery table is configured with `require_partition_filter = true`. The Gateway runs a pre-execution SQL parser verifying the presence of `transaction_timestamp` partition pruning. If absent or invalid, query is rejected before execution: "Query blocked: Mandatory date partition filter missing." |
 | `lookup_realtime_alerts` | Operational Cache Sub-Agent | Cloud Bigtable | `store_id: STRING`<br>`cashier_id: STRING (optional)`<br>`time_window_hours: INT64` | `active_alerts: INT`<br>`override_rate: FLOAT`<br>`flags: [...]`<br>SLA <15ms | If Bigtable connection times out, return default clean status with warning: "Real-time cache unavailable, falling back to batch stats". |
 | `search_technical_manuals` | RAG Manual Q&A Sub-Agent | BigQuery Vector Search | `query_text: STRING`<br>`top_k: INT64`<br>`threshold: 0.7` | `chunks: [{text, doc_name, page, section, score}]`<br>SLA <1.5s | If max score < 0.7, decline answer: "I cannot find certified warranty or repair rules for this specific error in our technical repository." |
 | `get_warranty_status` | Coordinator Router | Vertex AI / BigLake | `transaction_id: STRING`<br>`product_id: STRING` | `is_covered: BOOL`<br>`expiry_date: DATE`<br>`policy_citation: STRING`<br>SLA <2.0s | Return partial synthesis stating transaction verified but warranty policy lookup failed. |
@@ -595,13 +703,38 @@ flowchart TD
 | **Dynamic PII Masking** | 100% masking of PAN (`XXXX-XXXX-XXXX-9999`) | Query transactional tables using Store Manager persona; inspect payload to verify 0 plain-text card numbers. |
 | **Resilience & Partial Synthesis** | 100% graceful degradation upon simulated subsystem outage | Simulate connection drop on regional Bigtable; verify partial response delivered with clear user notification. |
 
+### **10.1. Verified AWS Glue Role Trust Policy (`cymbal-lakehouse`)**
+The BigLake REST Catalog Service Account (`100475264900969081922`) is verified and mapped into AWS IAM role `arn:aws:iam::621785110540:role/gcp-trust-role` using the following production trust policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "accounts.google.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "accounts.google.com:aud": "100475264900969081922",
+          "accounts.google.com:sub": "100475264900969081922"
+        }
+      }
+    }
+  ]
+}
+```
+
 ---
 
 # **10. Open Questions & Action Items**
 
-- [x] **BigLake Service Account Registration**: Retrieved Service Account ID `100475264900969081922` and submitted to workshop coordinators. — *Owner: Sarath P V (vanchee)*
+- [x] **BigLake Service Account Registration**: Retrieved Service Account ID `100475264900969081922` and mapped into AWS Glue trust policy. — *Owner: Sarath P V (vanchee)*
 - [x] **Model Endpoint Deployment**: BQML models copied, registered to Vertex AI Model Registry, and deployed to online prediction endpoints. — *Owner: Terraform Bootstrap*
 - [x] **Cloud Run Auto-Scaling Limits**: Defined `min_instances = 5` and `max_instances = 100` for `cymbal-agent-gateway`. — *Owner: Sarath P V (vanchee)*
 - [x] **Role-to-Tool Authorization Matrix**: Defined RBAC mapping for Cashier, Store Manager, and Auditor personas. — *Owner: Sarath P V (vanchee)*
-- [ ] **AWS Glue Role Trust Validation**: Confirm AWS IAM trust policy updated on `arn:aws:iam::621785110540:role/gcp-trust-role` ahead of Module 2. — *Owner: Workshop Instructor*
-- [ ] **Synthetic POS Generator Provisioning**: Launch synthetic event generator on Day 2 to publish checkout transactions to Managed Kafka topic `pos-transactions`. — *Owner: Sarath P V (vanchee)*
+- [x] **AWS Glue Role Trust Validation**: Confirmed AWS IAM trust policy with Service Account ID `100475264900969081922`. — *Owner: Sarath P V (vanchee)*
+- [x] **POS Streaming JSON Schema**: Formalized schema contract for `pos-transactions` in Section 4.1. — *Owner: Sarath P V (vanchee)*
+- [x] **POS Error Code Fallback Matrix**: Detailed operational handling for `ERR-PAY-4001`, `ERR-SYNC-900`, `ERR-KAFKA-503` in Section 5.3. — *Owner: Sarath P V (vanchee)*
