@@ -6,7 +6,7 @@
 
 | Field | Value |
 | :---- | :---- |
-| Author(s) | Google Cloud Architecture & Engineering Team / Participant |
+| Author(s) | Sarath P V (vanchee) / Google Cloud Solution Team |
 | Date | September 8, 2026 |
 | Status | Approved (Ready for Evaluation) |
 | Target Audience | Evaluation Committee, Enterprise Lead Architects, CIO, VP of Data & AI |
