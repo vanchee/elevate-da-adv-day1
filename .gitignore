@@ -61,3 +61,7 @@ fixtures/
 /tmp/
 *.local
 .DS_Store
+
+# Bootstrap logs
+bootstrap_*.txt
+deploy/bootstrap_*.txt
